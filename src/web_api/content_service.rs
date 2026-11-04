@@ -1,3 +1,4 @@
+// Modified by Aurelia; see README.
 use reqwest::Client;
 
 use crate::Error;
@@ -28,7 +29,7 @@ struct ContentServerDirectory {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CDNServer {
     pub r#type: String,
     pub https: bool,
@@ -38,6 +39,7 @@ pub struct CDNServer {
     pub cell_id: u32,
     pub load: u32,
     pub weighted_load: u32,
+    pub auth_token: Option<String>,
 }
 
 pub async fn get_servers_for_steam_pipe(cell_id: u32) -> Result<Vec<CDNServer>, Error> {
@@ -61,6 +63,7 @@ pub async fn get_servers_for_steam_pipe(cell_id: u32) -> Result<Vec<CDNServer>, 
                     cell_id: server.cell_id.unwrap_or(0),
                     load: server.load,
                     weighted_load: server.weighted_load,
+                    auth_token: None,
                 }
             })
             .collect::<Vec<CDNServer>>()

@@ -1,3 +1,4 @@
+// Modified by Aurelia; see README.
 #[macro_use]
 extern crate serde;
 #[macro_use]
@@ -7,7 +8,9 @@ mod cdn;
 mod crypto;
 mod error;
 mod utils;
-mod web_api;
+pub mod web_api;
 
 pub use cdn::CDNClient;
+pub use cdn::download_concurrency;
+pub use cdn::manifest::file::ProgressFn;
 pub use error::Error;

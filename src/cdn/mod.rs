@@ -1,18 +1,19 @@
+// Modified by Aurelia; see README.
 use depot::AppDepots;
 use inner::InnerClient;
 use manifest::DepotManifest;
+use futures::TryStreamExt;
 use std::sync::Arc;
-use steam_vent::{
-    proto::{
-        steammessages_clientserver_2::{
-            CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
-        },
-        steammessages_contentsystem_steamclient::CContentServerDirectory_GetManifestRequestCode_Request,
+use std::sync::atomic::{AtomicBool, Ordering};
+use steam_vent::{Connection, ConnectionTrait};
+use steam_vent_proto::{
+    steammessages_clientserver_2::{
+        CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
     },
-    Connection, ConnectionTrait,
+    steammessages_contentsystem_steamclient::CContentServerDirectory_GetManifestRequestCode_Request,
 };
 
-use crate::Error;
+use crate::{error::Error, web_api, web_api::content_service::CDNServer};
 
 pub mod depot;
 pub mod depot_chunk;
@@ -21,15 +22,50 @@ pub mod manifest;
 
 pub const MANIFEST_VERSION: usize = 5;
 
+/// Default chunk requests in flight.
+pub const DEFAULT_CONCURRENCY: usize = 16;
+
+/// `AURELIA_CDN_CONCURRENCY`, clamped 1..=64.
+pub fn download_concurrency() -> usize {
+    std::env::var("AURELIA_CDN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 64))
+        .unwrap_or(DEFAULT_CONCURRENCY)
+}
+
 #[derive(Debug)]
 pub struct CDNClient {
     inner: Arc<InnerClient>,
 }
 
 impl CDNClient {
-    pub async fn new(connection: Arc<Connection>) -> Result<Self, Error> {
-        Ok(Self {
+    pub fn new(connection: Arc<Connection>) -> Self {
+        Self {
             inner: Arc::new(InnerClient::new(connection)),
+        }
+    }
+
+    pub fn with_servers(connection: Arc<Connection>, servers: Vec<CDNServer>) -> Self {
+        let mut inner = InnerClient::new(connection);
+        inner.set_servers(servers);
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub fn with_server(connection: Arc<Connection>, server: CDNServer) -> Self {
+        Self::with_servers(connection, vec![server])
+    }
+
+    pub async fn discover(connection: Arc<Connection>) -> Result<Self, Error> {
+        let mut inner = InnerClient::new(connection);
+        let mut servers =
+            web_api::content_service::get_servers_for_steam_pipe(inner.cell_id()).await?;
+        servers.sort_by_key(|s| s.weighted_load);
+        inner.set_servers(servers);
+        Ok(Self {
+            inner: Arc::new(inner),
         })
     }
 
@@ -95,8 +131,131 @@ impl CDNClient {
             ))
     }
 
+    pub async fn download_depot(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: u64,
+        depot_key: &[u8],
+        target_dir: impl AsRef<std::path::Path>,
+        manifest_request_code: Option<u64>,
+        verify_mode: bool,
+        abort_signal: Option<Arc<AtomicBool>>,
+        on_progress: Option<manifest::file::ProgressFn>,
+        on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+    ) -> Result<(), Error> {
+        let request_code = if manifest_request_code.is_some() {
+            manifest_request_code
+        } else {
+            self.get_manifest_request_code(app_id, depot_id, manifest_id)
+                .await
+                .ok()
+        };
+
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&depot_key[..32]);
+
+        let manifest = self
+            .get_manifest(app_id, depot_id, manifest_id, request_code, Some(key_arr))
+            .await?;
+
+        if let Some(ref cb) = on_manifest {
+            cb(manifest.original_size());
+        }
+
+        let target_dir = target_dir.as_ref();
+        let aborted = || abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
+
+        // Folders and links first, in order.
+        let mut regular = Vec::new();
+        for file in manifest.files() {
+            if aborted() {
+                return Ok(());
+            }
+            let full_path = target_dir.join(file.full_path());
+
+            if file.flags() & manifest::file::FLAG_DIRECTORY != 0 {
+                std::fs::create_dir_all(&full_path).map_err(Error::Io)?;
+                continue;
+            }
+            if let Some(parent) = full_path.parent() {
+                std::fs::create_dir_all(parent).map_err(Error::Io)?;
+            }
+
+            let linktarget = file.linktarget();
+            let is_symlink = file.flags() & manifest::file::FLAG_SYMLINK != 0;
+            if !linktarget.is_empty() || is_symlink {
+                #[cfg(unix)]
+                {
+                    // Symlink entries without a linktarget field carry the
+                    // target path as their chunk content instead.
+                    let raw_target = if !linktarget.is_empty() {
+                        linktarget
+                    } else {
+                        let bytes = file.download_to_memory(key_arr).await?;
+                        String::from_utf8(bytes)
+                            .map_err(|e| Error::Unexpected(e.to_string()))?
+                    };
+                    let target = raw_target
+                        .trim_matches(|c: char| c.is_whitespace() || c == '\0')
+                        .replace('\\', "/");
+                    if target.is_empty() {
+                        return Err(Error::Unexpected(format!(
+                            "symlink entry {} has no target",
+                            file.full_path()
+                        )));
+                    }
+                    let points_there = std::fs::read_link(&full_path)
+                        .is_ok_and(|existing| existing == std::path::Path::new(&target));
+                    if !points_there {
+                        let _ = std::fs::remove_file(&full_path);
+                        std::os::unix::fs::symlink(&target, &full_path).map_err(Error::Io)?;
+                    }
+                }
+                continue;
+            }
+            regular.push((file, full_path));
+        }
+
+        // Files in parallel, one chunk budget.
+        let concurrency = download_concurrency();
+        let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        futures::stream::iter(regular.into_iter().map(Ok::<_, Error>))
+            .try_for_each_concurrent(concurrency, |(file, full_path)| {
+                let limit = limit.clone();
+                let abort_signal = abort_signal.clone();
+                let on_progress = on_progress.clone();
+                async move {
+                    if abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                        return Ok(());
+                    }
+                    if file.size() > 0 {
+                        file.download(
+                            key_arr,
+                            &full_path,
+                            verify_mode,
+                            abort_signal,
+                            Some(limit),
+                            on_progress,
+                        )
+                        .await
+                    } else {
+                        if !full_path.is_file() {
+                            std::fs::File::create(&full_path).map_err(Error::Io)?;
+                        }
+                        #[cfg(unix)]
+                        file.apply_unix_mode(&full_path).await?;
+                        Ok(())
+                    }
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_manifest(
         &self,
+        app_id: u32,
         depot_id: u32,
         manifest_id: u64,
         request_code: Option<u64>,
@@ -104,16 +263,11 @@ impl CDNClient {
     ) -> Result<DepotManifest, Error> {
         let bytes = self
             .inner
-            .remote_cmd(
-                "depot",
-                format!("{depot_id}/manifest/{manifest_id}/{MANIFEST_VERSION}"),
-                request_code,
-            )
-            .await?
-            .bytes()
+            .get_manifest_bytes(depot_id, manifest_id, request_code, MANIFEST_VERSION)
             .await?;
 
-        let mut manifest = DepotManifest::deserialize(self.inner.clone(), &bytes[..])?;
+        let mut manifest =
+            DepotManifest::deserialize(self.inner.clone(), app_id, depot_id, manifest_id, &bytes[..])?;
         if manifest.filenames_encrypted() {
             if let Some(key) = depot_key {
                 manifest.decrypt_filenames(key)?;
@@ -121,5 +275,22 @@ impl CDNClient {
         }
 
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrency_env_is_clamped() {
+        // One test owns the variable.
+        unsafe { std::env::remove_var("AURELIA_CDN_CONCURRENCY") };
+        assert_eq!(download_concurrency(), DEFAULT_CONCURRENCY);
+        for (value, expected) in [("8", 8), ("0", 1), ("500", 64), ("x", DEFAULT_CONCURRENCY)] {
+            unsafe { std::env::set_var("AURELIA_CDN_CONCURRENCY", value) };
+            assert_eq!(download_concurrency(), expected, "{value}");
+        }
+        unsafe { std::env::remove_var("AURELIA_CDN_CONCURRENCY") };
     }
 }

@@ -1,4 +1,6 @@
+// Modified by Aurelia; see README.
 use aes::cipher::block_padding;
+use bytes::TryGetError;
 use std::{io, str};
 use zip::result::ZipError;
 
@@ -37,6 +39,12 @@ impl From<protobuf::Error> for ManifestError {
 impl From<base64::DecodeError> for ManifestError {
     fn from(err: base64::DecodeError) -> Self {
         Self::DecryptFilename(err.to_string())
+    }
+}
+
+impl From<TryGetError> for ManifestError {
+    fn from(err: TryGetError) -> Self {
+        Self::Eof(err.to_string())
     }
 }
 
