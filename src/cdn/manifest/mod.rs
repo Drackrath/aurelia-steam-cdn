@@ -102,17 +102,17 @@ impl DepotManifest {
         let raw_data = if is_zip {
             let cursor = Cursor::new(data);
             match ZipArchive::new(cursor) {
-                Ok(mut archive) if archive.len() > 0 => {
-                    if let Ok(mut file) = archive.by_index(0) {
+                // Match keeps 2021 drop order.
+                Ok(mut archive) if archive.len() > 0 => match archive.by_index(0) {
+                    Ok(mut file) => {
                         if file.read_to_end(&mut buffer).is_ok() {
                             &buffer[..]
                         } else {
                             data
                         }
-                    } else {
-                        data
                     }
-                }
+                    _ => data,
+                },
                 _ => data,
             }
         } else {
