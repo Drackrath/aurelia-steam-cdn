@@ -84,7 +84,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurelia-steam-cdn"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "aes",
  "aurelia-steam-vent",
@@ -110,9 +110,9 @@ dependencies = [
 
 [[package]]
 name = "aurelia-steam-vent"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f642027f9072e41929e0acbe318426668dcb68ab50fd3230d5fb9fdb3f2cf48"
+checksum = "58ec8ffa1235907b7518546eda49008e57da3489b0cc7a4c54829db8a2ef7976"
 dependencies = [
  "another-steam-totp",
  "async-stream",
