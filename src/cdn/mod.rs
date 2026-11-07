@@ -19,6 +19,7 @@ pub mod depot;
 pub mod depot_chunk;
 pub mod inner;
 pub mod manifest;
+pub(crate) mod paths;
 
 pub const MANIFEST_VERSION: usize = 5;
 
@@ -163,7 +164,7 @@ impl CDNClient {
             cb(manifest.original_size());
         }
 
-        let target_dir = target_dir.as_ref();
+        let target_dir = paths::prepare_root(target_dir.as_ref())?;
         let aborted = || abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
 
         // Folders and links first, in order.
@@ -172,13 +173,16 @@ impl CDNClient {
             if aborted() {
                 return Ok(());
             }
-            let full_path = target_dir.join(file.full_path());
+            let relative = paths::relative_entry(&file.full_path())?;
+            let full_path = target_dir.join(&relative);
 
             if file.flags() & manifest::file::FLAG_DIRECTORY != 0 {
+                paths::ensure_inside(&target_dir, &full_path)?;
                 std::fs::create_dir_all(&full_path).map_err(Error::Io)?;
                 continue;
             }
             if let Some(parent) = full_path.parent() {
+                paths::ensure_inside(&target_dir, parent)?;
                 std::fs::create_dir_all(parent).map_err(Error::Io)?;
             }
 
@@ -192,6 +196,12 @@ impl CDNClient {
                     let raw_target = if !linktarget.is_empty() {
                         linktarget
                     } else {
+                        if file.size() > paths::MAX_LINK_TARGET {
+                            return Err(Error::Unexpected(format!(
+                                "symlink entry {} target too long",
+                                file.full_path()
+                            )));
+                        }
                         let bytes = file.download_to_memory(key_arr).await?;
                         String::from_utf8(bytes)
                             .map_err(|e| Error::Unexpected(e.to_string()))?
@@ -204,6 +214,13 @@ impl CDNClient {
                             "symlink entry {} has no target",
                             file.full_path()
                         )));
+                    }
+                    if !paths::link_stays_inside(&relative, &target) {
+                        tracing::warn!(
+                            "Skipping symlink {} -> {target}: leaves install dir",
+                            file.full_path()
+                        );
+                        continue;
                     }
                     let points_there = std::fs::read_link(&full_path)
                         .is_ok_and(|existing| existing == std::path::Path::new(&target));
@@ -229,6 +246,7 @@ impl CDNClient {
                     if abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
                         return Ok(());
                     }
+                    paths::unlink_symlink(&full_path)?;
                     if file.size() > 0 {
                         file.download(
                             key_arr,

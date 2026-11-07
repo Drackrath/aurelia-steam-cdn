@@ -24,6 +24,22 @@ const VSZ_HEADER_LENGTH: usize = 8;
 const VSZ_FOOTER_MAGIC: [u8; 3] = [b'z', b's', b'v'];
 const VSZ_FOOTER_LENGTH: usize = 11;
 
+/// Smallest valid VZ container.
+const VZ_MIN_LENGTH: usize = VZ_HEADER_LENGTH + 5 + VZ_FOOTER_LENGTH;
+
+/// Read up to `max_len` bytes.
+pub fn read_bounded<R: std::io::Read>(reader: R, max_len: usize) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let limit = (max_len as u64).saturating_add(1);
+    std::io::Read::read_to_end(&mut reader.take(limit), &mut out)?;
+    if out.len() > max_len {
+        return Err(Error::Decompress(format!(
+            "decompressed data exceeds {max_len} bytes"
+        )));
+    }
+    Ok(out)
+}
+
 pub fn is_vz(data: &[u8]) -> bool {
     data.len() >= 2 && u16::from_le_bytes([data[0], data[1]]) == VZ_HEADER
 }
@@ -32,8 +48,8 @@ pub fn is_vsz(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..3] == VSZ_HEADER && data[3] == VSZ_VERSION
 }
 
-/// Decompress a Steam "VSZ" (Zstandard) chunk container.
-pub fn decompress_vsz(data: &[u8]) -> Result<Vec<u8>, Error> {
+/// Decompress a VSZ (Zstandard) chunk.
+pub fn decompress_vsz(data: &[u8], max_len: usize) -> Result<Vec<u8>, Error> {
     if !is_vsz(data) {
         return Err(Error::Decompress("expecting VSZ header".to_string()));
     }
@@ -50,12 +66,14 @@ pub fn decompress_vsz(data: &[u8]) -> Result<Vec<u8>, Error> {
     let frame = &data[VSZ_HEADER_LENGTH..data.len() - VSZ_FOOTER_LENGTH];
     let mut decoder = ruzstd::StreamingDecoder::new(std::io::Cursor::new(frame))
         .map_err(|e| Error::Decompress(format!("zstd frame: {e}")))?;
-    let mut out = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut out)?;
-    Ok(out)
+    read_bounded(&mut decoder, max_len)
 }
 
-pub async fn decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
+/// Decompress a VZ (LZMA) chunk.
+pub async fn decompress(data: &[u8], max_len: usize) -> Result<Vec<u8>, Error> {
+    if data.len() < VZ_MIN_LENGTH {
+        return Err(Error::Eof("VZ chunk too small".to_string()));
+    }
     let mut cursor = Cursor::new(data);
     if cursor.read_u16_le().await? != VZ_HEADER {
         return Err(Error::Eof("expecting VZ header".to_string()));
@@ -79,6 +97,11 @@ pub async fn decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
 
     if cursor.read_u16_le().await? != VZ_FOOTER {
         return Err(Error::Eof("expecting VZ at end of stream".to_string()));
+    }
+    if decompressed_size as usize > max_len {
+        return Err(Error::Decompress(format!(
+            "VZ declares {decompressed_size} bytes, limit is {max_len}"
+        )));
     }
 
     let decompressed_data = task::spawn_blocking(move || -> Result<Vec<u8>, Error> {
@@ -109,9 +132,45 @@ pub async fn decompress(data: &[u8]) -> Result<Vec<u8>, Error> {
     })
     .await??;
 
+    if decompressed_data.len() != decompressed_size as usize {
+        return Err(Error::Decompress("VZ size mismatch".to_string()));
+    }
     if decompressed_crc32 != crc32fast::hash(&decompressed_data) {
         return Err(Error::Decompress("crc32 mismatch".to_string()));
     }
 
     Ok(decompressed_data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_bounded_allows_exact_limit() {
+        assert_eq!(read_bounded(&[7u8; 16][..], 16).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn read_bounded_rejects_overflow() {
+        assert!(matches!(read_bounded(&[7u8; 17][..], 16), Err(Error::Decompress(_))));
+    }
+
+    #[tokio::test]
+    async fn short_vz_is_rejected_not_underflowed() {
+        // Valid header, nothing after it.
+        let data = [0x56, 0x5A, b'a', 0, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(decompress(&data, 1024).await, Err(Error::Eof(_))));
+    }
+
+    #[tokio::test]
+    async fn vz_declared_size_over_limit_is_rejected() {
+        let mut data = vec![0x56, 0x5A, b'a', 0, 0, 0, 0];
+        data.extend_from_slice(&[0x5D, 0, 0, 1, 0]);
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&0x767Au16.to_le_bytes());
+        assert!(matches!(decompress(&data, 1024).await, Err(Error::Decompress(_))));
+    }
 }

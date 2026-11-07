@@ -48,6 +48,27 @@ pub(crate) fn backoff(attempt: u32) -> Duration {
     Duration::from_millis((200u64 << attempt.min(4)).min(3_000))
 }
 
+/// Match a chunk's size and SHA-1.
+pub(crate) fn check_chunk(
+    chunk_id: &str,
+    data: Vec<u8>,
+    expected_sha: &[u8],
+    expected_len: u32,
+) -> Result<Vec<u8>, Error> {
+    use sha1::Digest;
+    if data.len() != expected_len as usize {
+        return Err(Error::Decompress(format!(
+            "chunk {chunk_id}: {} bytes, manifest says {expected_len}",
+            data.len()
+        )));
+    }
+    // Empty hash: nothing to compare.
+    if !expected_sha.is_empty() && sha1::Sha1::digest(&data).as_slice() != expected_sha {
+        return Err(Error::Decompress(format!("chunk {chunk_id}: SHA-1 mismatch")));
+    }
+    Ok(data)
+}
+
 /// Whether another try may succeed.
 pub(crate) fn retryable(err: &Error) -> bool {
     matches!(
@@ -234,12 +255,15 @@ impl InnerClient {
             .await
     }
 
+    /// Fetch one chunk, manifest-verified.
     pub async fn get_chunk(
         &self,
         _app_id: u32,
         depot_id: u32,
         depot_key: [u8; 32],
         chunk_id: String,
+        expected_sha: &[u8],
+        expected_len: u32,
     ) -> Result<Vec<u8>, Error> {
         let args = format!("{depot_id}/chunk/{chunk_id}");
         let mut last = Error::Network("no available cdn servers".to_string());
@@ -249,7 +273,13 @@ impl InnerClient {
             let result = match bytes {
                 Ok(bytes) => {
                     let mut bytes = bytes.to_vec();
-                    depot_chunk::decrypt_and_decompress(&mut bytes[..], depot_key).await
+                    depot_chunk::decrypt_and_decompress(
+                        &mut bytes[..],
+                        depot_key,
+                        expected_len as usize,
+                    )
+                    .await
+                    .and_then(|data| check_chunk(&chunk_id, data, expected_sha, expected_len))
                 }
                 Err(e) => Err(e),
             };
@@ -271,6 +301,31 @@ impl InnerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sha(data: &[u8]) -> Vec<u8> {
+        use sha1::Digest;
+        sha1::Sha1::digest(data).to_vec()
+    }
+
+    #[test]
+    fn matching_chunk_passes() {
+        let data = b"chunk bytes".to_vec();
+        let hash = sha(&data);
+        assert_eq!(check_chunk("c", data.clone(), &hash, 11).unwrap(), data);
+    }
+
+    #[test]
+    fn substituted_chunk_is_rejected_and_retryable() {
+        let err = check_chunk("c", b"other bytes".to_vec(), &sha(b"chunk bytes"), 11).unwrap_err();
+        assert!(retryable(&err), "{err}");
+    }
+
+    #[test]
+    fn wrong_length_chunk_is_rejected() {
+        let data = b"chunk bytes!".to_vec();
+        let hash = sha(&data);
+        assert!(check_chunk("c", data, &hash, 11).is_err());
+    }
 
     #[test]
     fn picks_round_robin_from_start() {
