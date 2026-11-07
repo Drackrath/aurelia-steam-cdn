@@ -6,8 +6,10 @@ This is the [Aurelia](https://github.com/Drackrath/Aurelia) fork of
 [steam-cdn](https://github.com/OccamyLab/steam-cdn). It differs from upstream in
 these ways:
 
-- Ported to steam-vent 0.5 and reqwest 0.13. Protos now come from
-  `steam-vent-proto`.
+- Built on [aurelia-steam-vent](https://codeberg.org/Drackrath/aurelia-steam-vent)
+  0.7 (a steam-vent fork with per-session logon IDs) and reqwest 0.13, so it
+  takes an `aurelia-steam-vent` connection. Protos come from `steam-vent-proto`.
+- Uses Rust edition 2024.
 - Supports Steam's VSZ/Zstd chunk containers.
 - Downloads chunks in parallel, with host failover and retries.
 - Skips existing chunks only when their SHA matches, not on file length alone.
