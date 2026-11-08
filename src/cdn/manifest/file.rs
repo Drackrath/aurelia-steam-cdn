@@ -129,7 +129,14 @@ impl ManifestFile {
         for chunk in self.chunks().iter().sorted_by(|a, b| a.offset.cmp(&b.offset)) {
             let data = self
                 .inner
-                .get_chunk(self.app_id, self.depot_id, depot_key, chunk.id())
+                .get_chunk(
+                    self.app_id,
+                    self.depot_id,
+                    depot_key,
+                    chunk.id(),
+                    &chunk.sha,
+                    chunk.original_size,
+                )
                 .await?;
             let offset = chunk.offset as usize;
             let end = offset.saturating_add(data.len()).min(buffer.len());
@@ -314,7 +321,14 @@ impl ChunkJob {
         }
         let data = self
             .inner
-            .get_chunk(self.app_id, self.depot_id, self.depot_key, self.id.clone())
+            .get_chunk(
+                self.app_id,
+                self.depot_id,
+                self.depot_key,
+                self.id.clone(),
+                &self.sha,
+                self.size,
+            )
             .await?;
         // On arrival, not in file order.
         if let Some(cb) = &on_progress {

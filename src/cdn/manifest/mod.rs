@@ -21,6 +21,8 @@ pub mod error;
 pub mod file;
 
 const PROTOBUF_PAYLOAD_MAGIC: u32 = 0x71F617D0;
+/// Largest unzipped manifest accepted.
+const MAX_MANIFEST_LEN: usize = 512 * 1024 * 1024;
 const PROTOBUF_METADATA_MAGIC: u32 = 0x1F4812BE;
 const PROTOBUF_SIGNATURE_MAGIC: u32 = 0x1B81B817;
 const PROTOBUF_ENDOFMANIFEST_MAGIC: u32 = 0x32C415AB;
@@ -96,28 +98,10 @@ impl DepotManifest {
         manifest_gid: u64,
         data: &[u8],
     ) -> Result<Self, ManifestError> {
-        let mut buffer = Vec::new();
         let is_zip = data.len() > 2 && data[0] == 0x50 && data[1] == 0x4B;
 
-        let raw_data = if is_zip {
-            let cursor = Cursor::new(data);
-            match ZipArchive::new(cursor) {
-                // Match keeps 2021 drop order.
-                Ok(mut archive) if archive.len() > 0 => match archive.by_index(0) {
-                    Ok(mut file) => {
-                        if file.read_to_end(&mut buffer).is_ok() {
-                            &buffer[..]
-                        } else {
-                            data
-                        }
-                    }
-                    _ => data,
-                },
-                _ => data,
-            }
-        } else {
-            data
-        };
+        let buffer = if is_zip { unzip_manifest(data, MAX_MANIFEST_LEN)? } else { None };
+        let raw_data = buffer.as_deref().unwrap_or(data);
 
         let mut bytes = Bytes::from(raw_data.to_vec());
         let mut payload = None;
@@ -201,5 +185,59 @@ impl DepotManifest {
                 })
                 .collect::<Vec<ManifestFile>>(),
         })
+    }
+}
+
+/// Unzip, capped; `None` means raw.
+fn unzip_manifest(data: &[u8], max_len: usize) -> Result<Option<Vec<u8>>, ManifestError> {
+    let Ok(mut archive) = ZipArchive::new(Cursor::new(data)) else {
+        return Ok(None);
+    };
+    if archive.is_empty() {
+        return Ok(None);
+    }
+    let Ok(entry) = archive.by_index(0) else {
+        return Ok(None);
+    };
+    let mut out = Vec::new();
+    let limit = (max_len as u64).saturating_add(1);
+    if entry.take(limit).read_to_end(&mut out).is_err() {
+        return Ok(None);
+    }
+    if out.len() > max_len {
+        return Err(ManifestError::Decompress(format!(
+            "manifest exceeds {max_len} bytes unzipped"
+        )));
+    }
+    Ok(Some(out))
+}
+
+#[cfg(test)]
+mod unzip_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn zipped(len: usize) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut out);
+        zip.start_file("z", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(&vec![0u8; len]).unwrap();
+        zip.finish().unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn manifest_within_limit_unzips() {
+        assert_eq!(unzip_manifest(&zipped(64), 64).unwrap().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn manifest_over_limit_is_rejected() {
+        assert!(matches!(unzip_manifest(&zipped(65), 64), Err(ManifestError::Decompress(_))));
+    }
+
+    #[test]
+    fn non_zip_keeps_raw_bytes() {
+        assert!(unzip_manifest(b"PK not really", 64).unwrap().is_none());
     }
 }
