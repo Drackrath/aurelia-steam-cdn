@@ -20,6 +20,7 @@ pub mod depot_chunk;
 pub mod inner;
 pub mod manifest;
 pub(crate) mod paths;
+pub mod throttle;
 
 pub const MANIFEST_VERSION: usize = 5;
 
@@ -53,6 +54,14 @@ impl CDNClient {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Share `limiter` across this client.
+    pub fn with_rate_limiter(self, limiter: Arc<throttle::RateLimiter>) -> Self {
+        if !self.inner.set_limiter(limiter) {
+            tracing::warn!("cdn rate limiter already set");
+        }
+        self
     }
 
     pub fn with_server(connection: Arc<Connection>, server: CDNServer) -> Self {
@@ -235,7 +244,10 @@ impl CDNClient {
         }
 
         // Files in parallel, one chunk budget.
-        let concurrency = download_concurrency();
+        let concurrency = match self.inner.limiter() {
+            Some(limiter) => limiter.streams(download_concurrency()),
+            None => download_concurrency(),
+        };
         let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
         futures::stream::iter(regular.into_iter().map(Ok::<_, Error>))
             .try_for_each_concurrent(concurrency, |(file, full_path)| {

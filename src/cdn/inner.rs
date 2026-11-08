@@ -1,6 +1,6 @@
 // Modified by Aurelia; see README.
 use reqwest::{Client, Response};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 use steam_vent::{Connection, ConnectionTrait};
@@ -13,6 +13,7 @@ use steam_vent_proto::steammessages_clientserver_appinfo::{
 use crate::{web_api::content_service::CDNServer, Error};
 
 use super::depot_chunk;
+use super::throttle::RateLimiter;
 
 /// Tries per chunk, across the pool.
 pub(crate) const CHUNK_ATTEMPTS: u32 = 5;
@@ -28,6 +29,8 @@ pub(crate) struct InnerClient {
     strikes: Vec<AtomicU32>,
     /// Round-robin cursor.
     next: AtomicUsize,
+    /// Optional shared rate limit.
+    limiter: OnceLock<Arc<RateLimiter>>,
 }
 
 /// Index to use, skipping benched hosts.
@@ -81,6 +84,23 @@ pub(crate) fn retryable(err: &Error) -> bool {
     )
 }
 
+/// Read a body, pacing by `limiter`.
+pub(crate) async fn read_paced(
+    mut response: Response,
+    limiter: Option<&RateLimiter>,
+) -> Result<bytes::Bytes, Error> {
+    let Some(limiter) = limiter.filter(|l| l.is_limited()) else {
+        return Ok(response.bytes().await?);
+    };
+    let hint = response.content_length().unwrap_or(0).min(64 << 20) as usize;
+    let mut body = Vec::with_capacity(hint);
+    while let Some(piece) = response.chunk().await? {
+        limiter.acquire(piece.len() as u64).await;
+        body.extend_from_slice(&piece);
+    }
+    Ok(body.into())
+}
+
 /// HTTP client with stall protection.
 fn web_client() -> Client {
     Client::builder()
@@ -99,7 +119,23 @@ impl InnerClient {
             servers: Vec::new(),
             strikes: Vec::new(),
             next: AtomicUsize::new(0),
+            limiter: OnceLock::new(),
         }
+    }
+
+    /// Attach a rate limit once.
+    pub fn set_limiter(&self, limiter: Arc<RateLimiter>) -> bool {
+        self.limiter.set(limiter).is_ok()
+    }
+
+    /// The active limit, if any.
+    pub fn limiter(&self) -> Option<&Arc<RateLimiter>> {
+        self.limiter.get().filter(|l| l.is_limited())
+    }
+
+    /// Body bytes, paced by the limit.
+    async fn read_body(&self, response: Response) -> Result<bytes::Bytes, Error> {
+        read_paced(response, self.limiter().map(|l| l.as_ref())).await
     }
 
     /// Replace the pool, in preference order.
@@ -150,7 +186,7 @@ impl InnerClient {
                 if !status.is_success() {
                     return Err(Error::HttpStatus(status));
                 }
-                Ok(response.bytes().await?)
+                self.read_body(response).await
             }
             .await;
             match result {
@@ -365,5 +401,46 @@ mod tests {
         let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
         assert!(!retryable(&Error::Io(full)));
         assert!(!retryable(&Error::Unexpected("x".into())));
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve `len` bytes once.
+    async fn serve(len: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\n\r\n");
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&vec![7u8; len]).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn limited_body_takes_its_time() {
+        let url = serve(40_000).await;
+        let response = Client::new().get(url).send().await.unwrap();
+        let limiter = RateLimiter::new(100_000);
+        let start = Instant::now();
+        let body = read_paced(response, Some(&limiter)).await.unwrap();
+        assert_eq!(body.len(), 40_000);
+        assert!(start.elapsed() >= Duration::from_millis(350), "{:?}", start.elapsed());
+    }
+
+    #[tokio::test]
+    async fn unlimited_body_is_read_whole() {
+        let url = serve(40_000).await;
+        let response = Client::new().get(url).send().await.unwrap();
+        let body = read_paced(response, Some(&RateLimiter::new(0))).await.unwrap();
+        assert_eq!(body.len(), 40_000);
     }
 }
