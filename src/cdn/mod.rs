@@ -178,6 +178,8 @@ impl CDNClient {
 
         // Folders and links first, in order.
         let mut regular = Vec::new();
+        #[cfg(unix)]
+        let mut links: Vec<(std::path::PathBuf, String)> = Vec::new();
         for file in manifest.files() {
             if aborted() {
                 return Ok(());
@@ -224,7 +226,9 @@ impl CDNClient {
                             file.full_path()
                         )));
                     }
-                    if !paths::link_stays_inside(&relative, &target) {
+                    if !paths::link_stays_inside(&relative, &target)
+                        || !paths::link_resolves_inside(&target_dir, &full_path, &target)
+                    {
                         tracing::warn!(
                             "Skipping symlink {} -> {target}: leaves install dir",
                             file.full_path()
@@ -237,10 +241,16 @@ impl CDNClient {
                         let _ = std::fs::remove_file(&full_path);
                         std::os::unix::fs::symlink(&target, &full_path).map_err(Error::Io)?;
                     }
+                    links.push((full_path, target));
                 }
                 continue;
             }
             regular.push((file, full_path));
+        }
+        // Later links can redirect earlier ones.
+        #[cfg(unix)]
+        for removed in paths::prune_escaping_links(&target_dir, &links) {
+            tracing::warn!("Removed symlink {}: leaves install dir", removed.display());
         }
 
         // Files in parallel, one chunk budget.
@@ -254,11 +264,16 @@ impl CDNClient {
                 let limit = limit.clone();
                 let abort_signal = abort_signal.clone();
                 let on_progress = on_progress.clone();
+                let root = target_dir.clone();
                 async move {
                     if abort_signal.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
                         return Ok(());
                     }
                     paths::unlink_symlink(&full_path)?;
+                    // Links may have moved parents.
+                    if let Some(parent) = full_path.parent() {
+                        paths::ensure_inside(&root, parent)?;
+                    }
                     if file.size() > 0 {
                         file.download(
                             key_arr,
