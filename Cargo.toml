@@ -1,6 +1,6 @@
 [package]
 name = "aurelia-steam-cdn"
-version = "3.2.0"
+version = "3.2.1"
 edition = "2024"
 description = "Steam CDN client (Aurelia fork of steam-cdn, built on aurelia-steam-vent 0.7)"
 license = "GPL-3.0-or-later"
