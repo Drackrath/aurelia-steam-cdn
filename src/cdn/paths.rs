@@ -64,41 +64,53 @@ pub(crate) fn link_stays_inside(link: &Path, target: &str) -> bool {
     true
 }
 
+/// Most links followed per resolution.
+#[cfg(unix)]
+const MAX_LINK_DEPTH: usize = 40;
+
 /// Link stays inside, following disk links.
+#[cfg(unix)]
 pub(crate) fn link_resolves_inside(root: &Path, link: &Path, target: &str) -> bool {
     let target = Path::new(target);
     if target.as_os_str().is_empty() || target.has_root() {
         return false;
     }
-    let Some(mut cur) = link.parent().and_then(|p| p.canonicalize().ok()) else {
+    let Some(start) = link.parent().and_then(|p| p.canonicalize().ok()) else {
         return false;
     };
-    if !cur.starts_with(root) {
+    if !start.starts_with(root) {
         return false;
     }
+    let mut depth = 0;
+    resolve_through_links(start, target, &mut depth).is_some_and(|end| end.starts_with(root))
+}
+
+/// Walks `target` from `cur` through links.
+#[cfg(unix)]
+fn resolve_through_links(mut cur: PathBuf, target: &Path, depth: &mut usize) -> Option<PathBuf> {
     for component in target.components() {
         match component {
             Component::Normal(part) => {
                 cur.push(part);
-                // Follow existing links physically.
-                if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
-                    match cur.canonicalize() {
-                        Ok(real) => cur = real,
-                        Err(_) => return false,
+                // Only symlinks have a link target.
+                if let Ok(next) = std::fs::read_link(&cur) {
+                    *depth += 1;
+                    if *depth > MAX_LINK_DEPTH {
+                        return None;
                     }
+                    cur.pop();
+                    cur = resolve_through_links(cur, &next, depth)?;
                 }
             }
             Component::CurDir => {}
             Component::ParentDir => {
                 cur.pop();
             }
-            Component::RootDir | Component::Prefix(_) => return false,
-        }
-        if !cur.starts_with(root) {
-            return false;
+            Component::RootDir => cur = PathBuf::from("/"),
+            Component::Prefix(_) => return None,
         }
     }
-    true
+    Some(cur)
 }
 
 /// Remove links escaping root; returns removed.
@@ -232,6 +244,51 @@ mod tests {
         assert_eq!(removed, vec![root.join("l")]);
         assert!(std::fs::symlink_metadata(root.join("l")).is_err());
         assert!(std::fs::symlink_metadata(root.join("c")).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn so_chain_survives_prune_dangling_and_written() {
+        let root = scratch("sochain");
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1", lib.join("libfoo.so")).unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1.2.3", lib.join("libfoo.so.1")).unwrap();
+        let links = vec![
+            (lib.join("libfoo.so"), "libfoo.so.1".to_string()),
+            (lib.join("libfoo.so.1"), "libfoo.so.1.2.3".to_string()),
+        ];
+        // Real file not written yet.
+        assert!(prune_escaping_links(&root, &links).is_empty());
+        assert!(std::fs::symlink_metadata(lib.join("libfoo.so")).is_ok());
+        std::fs::write(lib.join("libfoo.so.1.2.3"), b"elf").unwrap();
+        assert!(prune_escaping_links(&root, &links).is_empty());
+        assert_eq!(std::fs::read(lib.join("libfoo.so")).unwrap(), b"elf");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_out_of_root_is_refused() {
+        let root = scratch("dangleout");
+        // Pre-existing link escaping root.
+        std::os::unix::fs::symlink("../nowhere/x", root.join("b")).unwrap();
+        assert!(!link_resolves_inside(&root, &root.join("a"), "b"));
+        std::os::unix::fs::symlink("/nowhere/y", root.join("abs")).unwrap();
+        assert!(!link_resolves_inside(&root, &root.join("a"), "abs"));
+        std::os::unix::fs::symlink("missing/z", root.join("d")).unwrap();
+        assert!(link_resolves_inside(&root, &root.join("a"), "d"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_loops_are_refused() {
+        let root = scratch("loop");
+        std::os::unix::fs::symlink("q", root.join("p")).unwrap();
+        std::os::unix::fs::symlink("p", root.join("q")).unwrap();
+        assert!(!link_resolves_inside(&root, &root.join("a"), "p"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
