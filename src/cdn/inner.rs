@@ -17,6 +17,11 @@ use super::throttle::RateLimiter;
 
 /// Tries per chunk, across the pool.
 pub(crate) const CHUNK_ATTEMPTS: u32 = 5;
+/// Largest chunk body accepted.
+pub(crate) const MAX_CHUNK_BODY: usize = crate::utils::lzma::MAX_CHUNK_LEN + (1 << 20);
+const _: () = assert!(MAX_CHUNK_BODY > crate::utils::lzma::MAX_CHUNK_LEN);
+/// Largest manifest body accepted.
+pub(crate) const MAX_MANIFEST_BODY: usize = 512 << 20;
 /// Failures before a host is benched.
 pub(crate) const BENCH_STRIKES: u32 = 3;
 
@@ -84,18 +89,30 @@ pub(crate) fn retryable(err: &Error) -> bool {
     )
 }
 
-/// Read a body, pacing by `limiter`.
+fn body_too_large(max_len: usize) -> Error {
+    Error::Network(format!("response body exceeds {max_len} bytes"))
+}
+
+/// Read body up to `max_len`, paced.
 pub(crate) async fn read_paced(
     mut response: Response,
     limiter: Option<&RateLimiter>,
+    max_len: usize,
 ) -> Result<bytes::Bytes, Error> {
-    let Some(limiter) = limiter.filter(|l| l.is_limited()) else {
-        return Ok(response.bytes().await?);
-    };
-    let hint = response.content_length().unwrap_or(0).min(64 << 20) as usize;
+    let declared = response.content_length().unwrap_or(0);
+    if declared > max_len as u64 {
+        return Err(body_too_large(max_len));
+    }
+    let limiter = limiter.filter(|l| l.is_limited());
+    let hint = (declared as usize).min(max_len).min(64 << 20);
     let mut body = Vec::with_capacity(hint);
     while let Some(piece) = response.chunk().await? {
-        limiter.acquire(piece.len() as u64).await;
+        if body.len().saturating_add(piece.len()) > max_len {
+            return Err(body_too_large(max_len));
+        }
+        if let Some(limiter) = limiter {
+            limiter.acquire(piece.len() as u64).await;
+        }
         body.extend_from_slice(&piece);
     }
     Ok(body.into())
@@ -134,8 +151,8 @@ impl InnerClient {
     }
 
     /// Body bytes, paced by the limit.
-    async fn read_body(&self, response: Response) -> Result<bytes::Bytes, Error> {
-        read_paced(response, self.limiter().map(|l| l.as_ref())).await
+    async fn read_body(&self, response: Response, max_len: usize) -> Result<bytes::Bytes, Error> {
+        read_paced(response, self.limiter().map(|l| l.as_ref()), max_len).await
     }
 
     /// Replace the pool, in preference order.
@@ -174,6 +191,7 @@ impl InnerClient {
         args: &str,
         manifest_request_code: Option<u64>,
         attempts: u32,
+        max_body: usize,
     ) -> Result<bytes::Bytes, Error> {
         let mut last = Error::Network("no available cdn servers".to_string());
         for attempt in 0..attempts {
@@ -186,7 +204,7 @@ impl InnerClient {
                 if !status.is_success() {
                     return Err(Error::HttpStatus(status));
                 }
-                self.read_body(response).await
+                self.read_body(response, max_body).await
             }
             .await;
             match result {
@@ -287,8 +305,14 @@ impl InnerClient {
         version: usize,
     ) -> Result<bytes::Bytes, Error> {
         let args = format!("{depot_id}/manifest/{manifest_id}/{version}");
-        self.get_with_failover("depot", &args, request_code, CHUNK_ATTEMPTS)
-            .await
+        self.get_with_failover(
+            "depot",
+            &args,
+            request_code,
+            CHUNK_ATTEMPTS,
+            MAX_MANIFEST_BODY,
+        )
+        .await
     }
 
     /// Fetch one chunk, manifest-verified.
@@ -301,10 +325,18 @@ impl InnerClient {
         expected_sha: &[u8],
         expected_len: u32,
     ) -> Result<Vec<u8>, Error> {
+        // Reject before any fetch.
+        if expected_len as usize > crate::utils::lzma::MAX_CHUNK_LEN {
+            return Err(Error::Unexpected(format!(
+                "chunk {chunk_id}: {expected_len} bytes exceeds ceiling"
+            )));
+        }
         let args = format!("{depot_id}/chunk/{chunk_id}");
         let mut last = Error::Network("no available cdn servers".to_string());
         for attempt in 0..CHUNK_ATTEMPTS {
-            let bytes = self.get_with_failover("depot", &args, None, 1).await;
+            let bytes = self
+                .get_with_failover("depot", &args, None, 1, MAX_CHUNK_BODY)
+                .await;
             // Corrupt transfers count as failures.
             let result = match bytes {
                 Ok(bytes) => {
@@ -425,13 +457,56 @@ mod pacing_tests {
         format!("http://{addr}/")
     }
 
+    /// Serve `len` bytes without length.
+    async fn serve_unsized(len: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let _ = socket.write_all(&vec![7u8; len]).await;
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn declared_oversized_body_is_rejected() {
+        let url = serve(5_000).await;
+        let response = Client::new().get(url).send().await.unwrap();
+        let err = read_paced(response, None, 4_096).await.unwrap_err();
+        assert!(matches!(err, Error::Network(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn streamed_oversized_body_is_rejected() {
+        let url = serve_unsized(5_000).await;
+        let response = Client::new().get(url).send().await.unwrap();
+        let err = read_paced(response, None, 4_096).await.unwrap_err();
+        assert!(matches!(err, Error::Network(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn body_at_limit_is_kept() {
+        let url = serve(4_096).await;
+        let response = Client::new().get(url).send().await.unwrap();
+        assert_eq!(
+            read_paced(response, None, 4_096).await.unwrap().len(),
+            4_096
+        );
+    }
+
     #[tokio::test]
     async fn limited_body_takes_its_time() {
         let url = serve(40_000).await;
         let response = Client::new().get(url).send().await.unwrap();
         let limiter = RateLimiter::new(100_000);
         let start = Instant::now();
-        let body = read_paced(response, Some(&limiter)).await.unwrap();
+        let body = read_paced(response, Some(&limiter), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.len(), 40_000);
         assert!(start.elapsed() >= Duration::from_millis(350), "{:?}", start.elapsed());
     }
@@ -440,7 +515,9 @@ mod pacing_tests {
     async fn unlimited_body_is_read_whole() {
         let url = serve(40_000).await;
         let response = Client::new().get(url).send().await.unwrap();
-        let body = read_paced(response, Some(&RateLimiter::new(0))).await.unwrap();
+        let body = read_paced(response, Some(&RateLimiter::new(0)), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.len(), 40_000);
     }
 }
