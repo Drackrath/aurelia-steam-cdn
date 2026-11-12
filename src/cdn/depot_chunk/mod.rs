@@ -14,6 +14,12 @@ pub async fn decrypt_and_decompress(
     key: [u8; 32],
     max_len: usize,
 ) -> Result<Vec<u8>, Error> {
+    if max_len > lzma::MAX_CHUNK_LEN {
+        return Err(Error::Unexpected(format!(
+            "chunk of {max_len} bytes exceeds {} byte ceiling",
+            lzma::MAX_CHUNK_LEN
+        )));
+    }
     if data.len() <= IV_LENGTH {
         return Err(Error::Eof("data is too small".to_string()));
     }
@@ -31,5 +37,19 @@ pub async fn decrypt_and_decompress(
         let mut archive = ZipArchive::new(cursor)?;
         let entry = archive.by_index(0)?;
         lzma::read_bounded(entry, max_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn over_ceiling_size_rejected_before_work() {
+        let mut data = vec![0u8; 64];
+        let err = decrypt_and_decompress(&mut data, [0u8; 32], lzma::MAX_CHUNK_LEN + 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unexpected(_)), "{err}");
     }
 }

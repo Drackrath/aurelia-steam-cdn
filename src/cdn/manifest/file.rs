@@ -343,6 +343,10 @@ impl ChunkJob {
             return Ok(false);
         };
         let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        // Oversized chunks: refetch, then reject.
+        if self.size as usize > crate::utils::lzma::MAX_CHUNK_LEN {
+            return Ok(false);
+        }
         if len < self.offset + self.size as u64 {
             return Ok(false);
         }
