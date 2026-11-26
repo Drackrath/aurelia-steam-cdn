@@ -22,6 +22,23 @@ pub const FLAG_DIRECTORY: u32 = 64;
 /// Steam EDepotFileFlag::Symlink bit.
 pub const FLAG_SYMLINK: u32 = 512;
 
+/// First bytes of executables a depot may ship without `FLAG_EXECUTABLE`.
+#[cfg(unix)]
+const EXECUTABLE_MAGIC: &[&[u8]] = &[
+    b"\x7fELF",
+    b"#!",
+    b"\xcf\xfa\xed\xfe", // Mach-O, 64-bit
+    b"\xce\xfa\xed\xfe", // Mach-O, 32-bit
+    b"\xca\xfe\xba\xbe", // universal Mach-O, and harmlessly Java class files
+    b"\xca\xfe\xba\xbf", // universal Mach-O, 64-bit offsets
+];
+
+/// Whether a file starting with `head` is an executable.
+#[cfg(unix)]
+fn looks_executable(head: &[u8]) -> bool {
+    EXECUTABLE_MAGIC.iter().any(|magic| head.starts_with(magic))
+}
+
 /// Largest file `download_to_memory` accepts.
 pub const MAX_IN_MEMORY_LEN: u64 = 64 << 20;
 
@@ -239,16 +256,13 @@ impl ManifestFile {
         use std::os::unix::fs::PermissionsExt;
 
         if self.flags & FLAG_EXECUTABLE == 0 {
-            // Flagless depots: detect ELF/shebang content.
+            // Flagless depots: detect executables by their first bytes.
             let mut head = [0u8; 4];
-            let looks_executable = match tokio::fs::File::open(target_path).await {
-                Ok(mut f) => match f.read(&mut head).await {
-                    Ok(n) => (n >= 4 && head == *b"\x7fELF") || (n >= 2 && head[..2] == *b"#!"),
-                    Err(_) => false,
-                },
-                Err(_) => false,
+            let read = match tokio::fs::File::open(target_path).await {
+                Ok(mut f) => f.read(&mut head).await.unwrap_or(0),
+                Err(_) => 0,
             };
-            if !looks_executable {
+            if !looks_executable(&head[..read]) {
                 return Ok(());
             }
         }
@@ -450,6 +464,36 @@ mod in_memory_tests {
         assert!(check_in_memory_len(MAX_IN_MEMORY_LEN).is_ok());
         assert!(check_in_memory_len(MAX_IN_MEMORY_LEN + 1).is_err());
         assert!(check_in_memory_len(u64::MAX).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod executable_tests {
+    use super::*;
+
+    #[test]
+    fn elf_and_scripts_look_executable() {
+        assert!(looks_executable(b"\x7fELF"));
+        assert!(looks_executable(b"#!/b"));
+    }
+
+    #[test]
+    fn mach_o_binaries_look_executable() {
+        for head in [
+            b"\xcf\xfa\xed\xfe",
+            b"\xce\xfa\xed\xfe",
+            b"\xca\xfe\xba\xbe",
+            b"\xca\xfe\xba\xbf",
+        ] {
+            assert!(looks_executable(head), "{head:x?}");
+        }
+    }
+
+    #[test]
+    fn data_files_do_not_look_executable() {
+        for head in [&b""[..], b"#", b"\x7fEL", b"PK\x03\x04", b"\x89PNG"] {
+            assert!(!looks_executable(head), "{head:x?}");
+        }
     }
 }
 
