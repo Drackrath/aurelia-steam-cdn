@@ -3,6 +3,7 @@ use depot::AppDepots;
 use futures::TryStreamExt;
 use inner::InnerClient;
 use manifest::DepotManifest;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use steam_vent::{Connection, ConnectionTrait};
@@ -39,6 +40,7 @@ pub fn download_concurrency() -> usize {
 #[derive(Debug)]
 pub struct CDNClient {
     inner: Arc<InnerClient>,
+    trusted_files: Arc<HashSet<String>>,
 }
 
 impl CDNClient {
@@ -47,6 +49,7 @@ impl CDNClient {
         inner.set_servers(servers);
         Self {
             inner: Arc::new(inner),
+            trusted_files: Arc::default(),
         }
     }
 
@@ -55,6 +58,13 @@ impl CDNClient {
         if !self.inner.set_limiter(limiter) {
             tracing::warn!("cdn rate limiter already set");
         }
+        self
+    }
+
+    /// Take these files (manifest paths) as already in place when their
+    /// size matches, without reading them back.
+    pub fn with_trusted_files(mut self, paths: Arc<HashSet<String>>) -> Self {
+        self.trusted_files = paths;
         self
     }
 
@@ -70,6 +80,7 @@ impl CDNClient {
         inner.set_servers(servers);
         Ok(Self {
             inner: Arc::new(inner),
+            trusted_files: Arc::default(),
         })
     }
 
@@ -256,12 +267,14 @@ impl CDNClient {
             None => download_concurrency(),
         };
         let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let trusted = self.trusted_files.clone();
         futures::stream::iter(regular.into_iter().map(Ok::<_, Error>))
             .try_for_each_concurrent(concurrency, |(file, full_path)| {
                 let limit = limit.clone();
                 let abort_signal = abort_signal.clone();
                 let on_progress = on_progress.clone();
                 let root = target_dir.clone();
+                let trusted = trusted.clone();
                 async move {
                     if abort_signal
                         .as_ref()
@@ -274,7 +287,16 @@ impl CDNClient {
                     if let Some(parent) = full_path.parent() {
                         paths::ensure_inside(&root, parent)?;
                     }
-                    if file.size() > 0 {
+                    let in_place = trusted.contains(&file.full_path())
+                        && std::fs::metadata(&full_path).is_ok_and(|m| m.len() == file.size());
+                    if in_place {
+                        #[cfg(unix)]
+                        file.apply_unix_mode(&full_path).await?;
+                        if let Some(cb) = &on_progress {
+                            cb(file.size(), true);
+                        }
+                        Ok(())
+                    } else if file.size() > 0 {
                         file.download(
                             key_arr,
                             &full_path,
