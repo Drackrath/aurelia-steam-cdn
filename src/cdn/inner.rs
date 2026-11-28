@@ -258,6 +258,7 @@ fn web_client() -> Client {
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(64)
+        .http1_only()
         .build()
         .unwrap_or_else(|_| Client::new())
 }

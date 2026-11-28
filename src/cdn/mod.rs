@@ -26,7 +26,7 @@ pub mod throttle;
 pub const MANIFEST_VERSION: usize = 5;
 
 /// Default chunk requests in flight.
-pub const DEFAULT_CONCURRENCY: usize = 16;
+pub const DEFAULT_CONCURRENCY: usize = 64;
 
 /// `AURELIA_CDN_CONCURRENCY`, clamped 1..=64.
 pub fn download_concurrency() -> usize {
