@@ -24,6 +24,9 @@ pub const FLAG_SYMLINK: u32 = 512;
 
 /// First bytes of executables a depot may ship without `FLAG_EXECUTABLE`.
 #[cfg(unix)]
+/// Chunks of one file read back from disk at a time.
+const DISK_CHECKS: usize = 4;
+
 const EXECUTABLE_MAGIC: &[&[u8]] = &[
     b"\x7fELF",
     b"#!",
@@ -214,6 +217,7 @@ impl ManifestFile {
             out.set_len(self.size).await.map_err(Error::Io)?;
         }
 
+        let disk = Arc::new(Semaphore::new(DISK_CHECKS));
         let tasks = self
             .chunks()
             .iter()
@@ -235,6 +239,7 @@ impl ManifestFile {
                 };
                 AbortOnDrop(tokio::spawn(job.run(
                     semaphore.clone(),
+                    disk.clone(),
                     abort_signal.clone(),
                     on_progress.clone(),
                 )))
@@ -323,6 +328,7 @@ impl ChunkJob {
     async fn run(
         self,
         semaphore: Arc<Semaphore>,
+        disk: Arc<Semaphore>,
         abort_signal: Option<Arc<AtomicBool>>,
         on_progress: Option<ProgressFn>,
     ) -> Result<(u64, Option<Vec<u8>>), Error> {
@@ -334,15 +340,22 @@ impl ChunkJob {
         if aborted() {
             return Ok((self.offset, None));
         }
+        // Disk checks don't hold back downloads.
+        if self.check_disk {
+            let _check = disk.acquire_owned().await?;
+            if aborted() {
+                return Ok((self.offset, None));
+            }
+            if self.on_disk().await? {
+                tracing::debug!("Verified chunk {}", self.id);
+                if let Some(cb) = &on_progress {
+                    cb(self.size as u64, true);
+                }
+                return Ok((self.offset, None));
+            }
+        }
         let _permit = semaphore.acquire_owned().await?;
         if aborted() {
-            return Ok((self.offset, None));
-        }
-        if self.check_disk && self.on_disk().await? {
-            tracing::debug!("Verified chunk {}", self.id);
-            if let Some(cb) = &on_progress {
-                cb(self.size as u64, true);
-            }
             return Ok((self.offset, None));
         }
         let data = self
